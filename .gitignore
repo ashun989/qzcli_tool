@@ -1,3 +1,5 @@
 cookies.txt
+/AGENTS.md
 */__pycache__/*
 qzcli.egg-info/*
+build
