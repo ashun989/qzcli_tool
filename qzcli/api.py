@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from .config import (
     get_api_base_url,
     get_credentials,
+    get_proxy_url,
     get_token_cache,
     save_token_cache,
     clear_token_cache,
@@ -36,6 +37,20 @@ class QzAPI:
             self._username, self._password = get_credentials()
         
         self._token: Optional[str] = None
+
+    def _get_proxies(self) -> Dict[str, str]:
+        """构造统一代理配置。"""
+        proxy_url = get_proxy_url()
+        if not proxy_url:
+            return {}
+        if proxy_url.startswith("socks5://"):
+            # requests + PySocks 使用 socks5h 时由代理端完成 DNS 解析，
+            # 更适合当前通过本地 SOCKS 代理访问公司内站点的场景。
+            proxy_url = "socks5h://" + proxy_url[len("socks5://"):]
+        return {
+            "http": proxy_url,
+            "https": proxy_url,
+        }
     
     def _get_token(self, force_refresh: bool = False) -> str:
         """获取 Access Token（带缓存）"""
@@ -58,6 +73,7 @@ class QzAPI:
             url,
             json={"username": self._username, "password": self._password},
             headers={"Content-Type": "application/json"},
+            proxies=self._get_proxies(),
             timeout=30,
         )
         
@@ -89,6 +105,7 @@ class QzAPI:
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
             },
+            proxies=self._get_proxies(),
             timeout=60,
         )
         
@@ -205,6 +222,7 @@ class QzAPI:
             url,
             json=payload,
             headers=headers,
+            proxies=self._get_proxies(),
             timeout=60,
         )
         
@@ -294,6 +312,7 @@ class QzAPI:
             url,
             json=payload,
             headers=headers,
+            proxies=self._get_proxies(),
             timeout=60,
         )
         
@@ -458,6 +477,7 @@ class QzAPI:
             url,
             json=payload,
             headers=headers,
+            proxies=self._get_proxies(),
             timeout=60,
         )
         
@@ -535,6 +555,7 @@ class QzAPI:
             url,
             json=payload,
             headers=headers,
+            proxies=self._get_proxies(),
             timeout=60,
         )
         
@@ -596,6 +617,7 @@ class QzAPI:
             url,
             json=payload,
             headers=headers,
+            proxies=self._get_proxies(),
             timeout=60,
         )
         
@@ -661,6 +683,7 @@ class QzAPI:
             url,
             json=payload,
             headers=headers,
+            proxies=self._get_proxies(),
             timeout=60,
         )
         
@@ -726,6 +749,9 @@ class QzAPI:
         from urllib.parse import urljoin, urlparse, parse_qs
         
         session = requests.Session()
+        proxies = self._get_proxies()
+        if proxies:
+            session.proxies.update(proxies)
         
         # 设置浏览器 User-Agent
         headers = {

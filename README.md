@@ -5,6 +5,7 @@
 ## 特性
 
 - **一键登录**: `qzcli login` 通过 CAS 认证自动获取 cookie，无需手动复制
+- **全局代理**: `qzcli proxy` 支持为所有请求配置 `https` / `socks5` 代理
 - **资源发现**: `qzcli res -u` 自动发现工作空间、计算组、规格等资源并本地缓存
 - **节点查询**: `qzcli avail` 查询各计算组空余节点，支持低优任务统计
 - **任务列表**: 美观的卡片式显示，完整 URL 方便点击
@@ -28,7 +29,7 @@ qzcli login -u 用户名 -p 密码 && qzcli avail
 ## 安装依赖
 
 ```bash
-pip install rich requests
+pip install rich requests PySocks
 ```
 
 ## 快速开始
@@ -37,14 +38,20 @@ pip install rich requests
 # 1. 登录（自动获取 cookie）
 qzcli login
 
-# 2. 更新资源缓存（首次使用必须执行，自动发现所有可访问的工作空间）
+# 2. 如需代理，先设置全局代理
+# qzcli proxy https://127.0.0.1:7890
+
+# 3. 更新资源缓存（首次使用必须执行，自动发现所有可访问的工作空间）
 qzcli res -u
 
-# 3. 查看空余节点
+# 4. 查看空余节点
 qzcli avail
 
-# 4. 查看运行中的任务
+# 5. 查看运行中的任务
 qzcli ls -c -r
+
+# 6. 查询某个计算组的可用规格
+qzcli specs -w CI -g H200
 ```
 
 > **重要**: 
@@ -101,6 +108,7 @@ qzcli ls -c -w CI -r
 | 命令 | 说明 | 示例 |
 |------|------|------|
 | `login` | CAS 登录获取 cookie | `qzcli login` |
+| `proxy` | 设置全局代理 | `qzcli proxy socks5://127.0.0.1:1080` |
 | `cookie` | 手动设置 cookie | `qzcli cookie -f cookies.txt` |
 
 ```bash
@@ -109,6 +117,21 @@ qzcli login
 
 # 带参数登录
 qzcli login -u 学工号 -p 密码
+
+# 设置全局 HTTPS 代理
+qzcli proxy https://127.0.0.1:7890
+
+# 设置全局 SOCKS5 代理
+qzcli proxy socks5://127.0.0.1:1080
+
+# 查看当前代理
+qzcli proxy --show
+
+# 测试代理连通性
+qzcli proxy --test
+
+# 清除代理
+qzcli proxy --clear
 
 # 查看当前 cookie
 qzcli cookie --show
@@ -183,6 +206,45 @@ qzcli ls --no-refresh       # 不刷新状态
 | `stop` | 停止任务 | `qzcli stop job-xxx` |
 | `watch` | 实时监控 | `qzcli watch -i 10` |
 | `track` | 追踪任务 | `qzcli track job-xxx` |
+| `create` | 从 JSON 文件创建任务 | `qzcli create -f job.json` |
+| `specs` | 查询计算组可用规格 | `qzcli specs -w CI -g H200` |
+
+```bash
+# 从 JSON 文件创建训练任务
+qzcli create -f job.json
+
+# 创建后显示原始 API 响应
+qzcli create -f job.json --json
+
+# 查询某个工作空间计算组的规格
+qzcli specs -w CI -g H200
+
+# 输出规格原始 JSON
+qzcli specs -w CI -g H200 --json
+```
+
+创建任务的 JSON 文件示意：
+
+```json
+{
+  "name": "demo-job",
+  "logic_compute_group_id": "lcg-xxxx",
+  "project_id": "project-xxxx",
+  "framework": "pytorch",
+  "command": "python train.py",
+  "task_priority": 4,
+  "workspace_id": "ws-xxxx",
+  "framework_config": [
+    {
+      "image": "docker.sii.shaipower.online/inspire-studio/pytorch:25.06-py3",
+      "image_type": "SOURCE_OFFICIAL",
+      "instance_count": 1,
+      "shm_gi": 0,
+      "spec_id": "spec-xxxx"
+    }
+  ]
+}
+```
 
 ### 工作空间视图
 
@@ -232,7 +294,7 @@ CI-情景智能
 
 | 文件 | 说明 |
 |------|------|
-| `config.json` | API 认证信息 |
+| `config.json` | API 认证信息与全局代理 |
 | `jobs.json` | 本地任务历史 |
 | `.cookie` | Cookie（login 命令自动管理） |
 | `resources.json` | 资源缓存（工作空间、计算组等） |
@@ -243,6 +305,30 @@ CI-情景智能
 export QZCLI_USERNAME="your_username"
 export QZCLI_PASSWORD="your_password"
 export QZCLI_API_URL="https://qz.sii.edu.cn"
+export QZCLI_PROXY_URL="socks5://127.0.0.1:1080"
+```
+
+## 代理配置
+
+如果当前网络不能直接访问 `*.sii.edu.cn`，可以设置全局代理。代理会覆盖：
+
+- OpenAPI 请求
+- 内部 `/api/v1/*` 请求
+- `qzcli login` 的 CAS / Keycloak / 启智站点登录流程
+
+支持的格式只有：
+
+- `https://host:port`
+- `socks5://host:port`
+
+其中 `socks5://` 在实际请求时会按 `socks5h://` 方式处理，由代理端完成 DNS 解析，避免本地 DNS 影响访问 `*.sii.edu.cn`。
+
+示例：
+
+```bash
+qzcli proxy https://127.0.0.1:7890
+qzcli proxy --show
+qzcli proxy --test
 ```
 
 ## 使用建议

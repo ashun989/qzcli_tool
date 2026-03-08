@@ -6,14 +6,20 @@ qzcli - 启智平台任务管理 CLI
 import sys
 import time
 import argparse
+import json
 import unicodedata
 from pathlib import Path
-from typing import Optional, List, Sequence
+from typing import Optional, List, Sequence, Dict, Any
+from urllib.parse import urlparse
+
+import requests
 
 from . import __version__
 from .config import (
     init_config, get_credentials, load_config, CONFIG_DIR, 
     save_cookie, get_cookie, clear_cookie,
+    save_proxy_url, get_proxy_url, get_proxy_source, clear_proxy_url,
+    get_api_base_url,
     save_resources, get_workspace_resources, load_all_resources,
     set_workspace_name, find_workspace_by_name, find_resource_by_name,
     list_cached_workspaces, update_workspace_projects, update_workspace_compute_groups,
@@ -136,6 +142,178 @@ def _format_percent(numerator: int, denominator: int) -> str:
     if denominator <= 0:
         return "-"
     return f"{(numerator / denominator) * 100:.1f}%"
+
+
+def _validate_proxy_url(proxy_url: str) -> str:
+    """校验代理 URL，仅允许 https 和 socks5。"""
+    value = proxy_url.strip()
+    parsed = urlparse(value)
+
+    if parsed.scheme not in {"https", "socks5"}:
+        raise ValueError("代理 URL 仅支持 https:// 和 socks5://")
+    if not parsed.netloc:
+        raise ValueError("代理 URL 格式无效，请使用 scheme://host:port")
+
+    return value
+
+
+def _requests_proxy_url(proxy_url: str) -> str:
+    """转换为 requests 实际使用的代理 URL。"""
+    if proxy_url.startswith("socks5://"):
+        return "socks5h://" + proxy_url[len("socks5://"):]
+    return proxy_url
+
+
+def _load_json_object(filepath: str) -> Dict[str, Any]:
+    """从文件中读取 JSON 对象。"""
+    path = Path(filepath)
+    if not path.exists():
+        raise ValueError(f"文件不存在: {path}")
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"JSON 解析失败: {e}") from e
+    except OSError as e:
+        raise ValueError(f"读取文件失败: {e}") from e
+
+    if not isinstance(data, dict):
+        raise ValueError("JSON 文件必须是对象，顶层不能是数组或其他类型")
+
+    return data
+
+
+def _validate_job_payload(payload: Dict[str, Any]) -> None:
+    """校验创建任务 payload 的核心字段。"""
+    required_fields = [
+        "name",
+        "logic_compute_group_id",
+        "project_id",
+        "framework",
+        "command",
+        "task_priority",
+        "workspace_id",
+        "framework_config",
+    ]
+    missing = [field for field in required_fields if field not in payload]
+    if missing:
+        raise ValueError(f"任务配置缺少必填字段: {', '.join(missing)}")
+
+    framework_config = payload.get("framework_config")
+    if not isinstance(framework_config, list) or not framework_config:
+        raise ValueError("framework_config 必须是非空数组")
+    if not isinstance(framework_config[0], dict):
+        raise ValueError("framework_config[0] 必须是对象")
+
+    required_framework_fields = ["image", "image_type", "instance_count", "shm_gi", "spec_id"]
+    fc_missing = [field for field in required_framework_fields if field not in framework_config[0]]
+    if fc_missing:
+        raise ValueError(f"framework_config[0] 缺少必填字段: {', '.join(fc_missing)}")
+
+
+def _resolve_workspace_id(workspace_input: str) -> str:
+    """解析工作空间名称或 ID。"""
+    if workspace_input.startswith("ws-"):
+        return workspace_input
+
+    workspace_id = find_workspace_by_name(workspace_input)
+    if workspace_id:
+        return workspace_id
+
+    raise ValueError(f"未找到名称为 '{workspace_input}' 的工作空间，请先运行 qzcli res -u")
+
+
+def _resolve_compute_group_id(workspace_id: str, group_input: str) -> str:
+    """解析计算组名称或 ID。"""
+    if group_input.startswith("lcg-"):
+        return group_input
+
+    group = find_resource_by_name(workspace_id, "compute_groups", group_input)
+    if group and group.get("id"):
+        return group["id"]
+
+    raise ValueError(f"未找到名称为 '{group_input}' 的计算组，请先运行 qzcli res -u")
+
+
+def _build_job_url(job_id: str, workspace_id: str) -> str:
+    """构造任务详情链接。"""
+    if not job_id or not workspace_id:
+        return ""
+    return f"https://qz.sii.edu.cn/jobs/distributedTrainingDetail/{job_id}?spaceId={workspace_id}"
+
+
+def _extract_created_job_id(result: Dict[str, Any]) -> str:
+    """从创建任务响应中提取 job_id。"""
+    for key in ("job_id", "id"):
+        value = result.get(key)
+        if isinstance(value, str) and value:
+            return value
+    data = result.get("data")
+    if isinstance(data, dict):
+        for key in ("job_id", "id"):
+            value = data.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return ""
+
+
+def _summarize_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """提取规格的稳定展示字段。"""
+    gpu_info = spec.get("gpu_info", {}) if isinstance(spec.get("gpu_info"), dict) else {}
+    spec_id = spec.get("spec_id") or spec.get("quota_id") or spec.get("id") or "-"
+    gpu_count = spec.get("gpu_count", 0)
+    cpu_count = spec.get("cpu_count", spec.get("cpu_num", 0))
+    memory_gb = spec.get("memory_size_gib", spec.get("memory_gb", spec.get("memory_size", 0)))
+    gpu_type = (
+        gpu_info.get("gpu_product_simple")
+        or gpu_info.get("gpu_type_display")
+        or spec.get("gpu_type")
+        or "-"
+    )
+    return {
+        "spec_id": spec_id,
+        "gpu_count": gpu_count,
+        "gpu_type": gpu_type,
+        "cpu_count": cpu_count,
+        "memory_gb": memory_gb,
+    }
+
+
+def _print_specs_summary(display, specs: List[Dict[str, Any]], title: str) -> None:
+    """打印规格摘要。"""
+    if not specs:
+        display.print("[dim]未找到可用规格[/dim]")
+        return
+
+    rows = [
+        (
+            item["spec_id"],
+            f'{item["gpu_count"]}x {item["gpu_type"]}' if item["gpu_count"] else item["gpu_type"],
+            item["cpu_count"],
+            item["memory_gb"],
+        )
+        for item in (_summarize_spec(spec) for spec in specs)
+    ]
+
+    display.print(f"\n[bold]{title}[/bold]\n")
+    if RICH_TABLE_AVAILABLE and getattr(display, "console", None):
+        table = Table(box=box.MINIMAL, show_header=True, header_style="bold", expand=False, padding=(0, 1))
+        table.add_column("Spec ID", style="cyan")
+        table.add_column("GPU", style="magenta")
+        table.add_column("CPU", justify="right")
+        table.add_column("Memory(GB)", justify="right")
+        for row in rows:
+            table.add_row(str(row[0]), str(row[1]), str(row[2]), str(row[3]))
+        display.console.print(table)
+    else:
+        for line in _render_plain_table(
+            headers=["Spec ID", "GPU", "CPU", "Memory(GB)"],
+            rows=rows,
+            aligns=["left", "left", "right", "right"],
+            max_widths=[36, 24, 8, 12],
+        ):
+            display.print(line)
 
 
 def cmd_init(args):
@@ -630,7 +808,7 @@ def cmd_cookie(args):
         display.print_error("cookie 不能为空")
         return 1
     
-    # 测试 cookie 是否有效（使用 /openapi/v1/train_job/list 端点）
+    # 测试 cookie 是否有效（使用内部 /api/v1/train_job/list 端点）
     if not args.no_test and workspace_id:
         display.print("正在验证 cookie...")
         api = get_api()
@@ -644,6 +822,172 @@ def cmd_cookie(args):
     
     save_cookie(cookie, workspace_id)
     display.print_success("Cookie 已保存")
+    return 0
+
+
+def cmd_proxy(args):
+    """管理全局代理配置"""
+    display = get_display()
+
+    if args.clear:
+        clear_proxy_url()
+        display.print_success("已清除保存的代理配置")
+        if get_proxy_source() == "env":
+            display.print("[dim]当前仍存在环境变量 QZCLI_PROXY_URL，后续请求会继续使用该值[/dim]")
+        return 0
+
+    if args.show:
+        proxy_url = get_proxy_url()
+        source = get_proxy_source()
+        if not proxy_url:
+            display.print("[dim]当前未配置代理[/dim]")
+            return 0
+
+        source_display = "环境变量 QZCLI_PROXY_URL" if source == "env" else "配置文件 ~/.qzcli/config.json"
+        display.print(f"Source: {source_display}")
+        display.print(f"Proxy: {proxy_url}")
+        return 0
+
+    if args.proxy:
+        try:
+            proxy_url = _validate_proxy_url(args.proxy)
+        except ValueError as e:
+            display.print_error(str(e))
+            return 1
+
+        save_proxy_url(proxy_url)
+        display.print_success(f"代理已保存: {proxy_url}")
+
+    if args.test:
+        proxy_url = get_proxy_url()
+        if not proxy_url:
+            display.print_error("未配置代理，请先执行 qzcli proxy <url>")
+            return 1
+
+        display.print(f"[dim]正在通过代理测试连通性: {proxy_url}[/dim]")
+        try:
+            request_proxy_url = _requests_proxy_url(proxy_url)
+            response = requests.get(
+                get_api_base_url(),
+                proxies={"http": request_proxy_url, "https": request_proxy_url},
+                timeout=15,
+                allow_redirects=True,
+            )
+            display.print_success(f"代理连通性测试成功: HTTP {response.status_code}")
+            return 0
+        except requests.RequestException as e:
+            display.print_error(f"代理连通性测试失败: {e}")
+            return 1
+
+    if args.proxy:
+        return 0
+
+    display.print("[dim]使用 qzcli proxy <https://host:port|socks5://host:port> 设置代理[/dim]")
+    return 0
+
+
+def cmd_create(args):
+    """通过 OpenAPI 创建训练任务。"""
+    display = get_display()
+    api = get_api()
+
+    try:
+        payload = _load_json_object(args.file)
+        _validate_job_payload(payload)
+    except ValueError as e:
+        display.print_error(str(e))
+        return 1
+
+    display.print("[dim]正在创建训练任务...[/dim]")
+    try:
+        result = api.create_job(payload)
+    except QzAPIError as e:
+        display.print_error(f"创建任务失败: {e}")
+        return 1
+
+    job_id = _extract_created_job_id(result if isinstance(result, dict) else {})
+    workspace_id = str(payload.get("workspace_id", ""))
+    spec_id = ""
+    framework_config = payload.get("framework_config", [])
+    if isinstance(framework_config, list) and framework_config and isinstance(framework_config[0], dict):
+        spec_id = str(framework_config[0].get("spec_id", ""))
+
+    display.print_success("任务创建成功")
+    if job_id:
+        display.print(f"Job ID: {job_id}")
+    display.print(f"Name: {payload.get('name', '')}")
+    display.print(f"Workspace: {workspace_id}")
+    display.print(f"Project: {payload.get('project_id', '')}")
+    display.print(f"Compute Group: {payload.get('logic_compute_group_id', '')}")
+    if spec_id:
+        display.print(f"Spec: {spec_id}")
+
+    url = _build_job_url(job_id, workspace_id)
+    if url:
+        display.print(f"URL: {url}")
+
+    if job_id:
+        store = get_store()
+        job = JobRecord(
+            job_id=job_id,
+            name=str(payload.get("name", "")),
+            status="job_pending",
+            workspace_id=workspace_id,
+            project_id=str(payload.get("project_id", "")),
+            command=str(payload.get("command", "")),
+            url=url,
+            source="create",
+            instance_count=int(framework_config[0].get("instance_count", 0)) if spec_id else 0,
+            gpu_count=int(framework_config[0].get("gpu_count", 0)) if spec_id else 0,
+        )
+        store.add(job)
+        display.print_success("已自动追踪新任务")
+    else:
+        display.print_warning("响应中未包含 job_id，未能自动追踪该任务")
+
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+
+    return 0
+
+
+def cmd_specs(args):
+    """查询计算组可用规格。"""
+    display = get_display()
+    api = get_api()
+
+    try:
+        workspace_id = _resolve_workspace_id(args.workspace)
+        group_id = _resolve_compute_group_id(workspace_id, args.group)
+    except ValueError as e:
+        display.print_error(str(e))
+        return 1
+
+    ws_resources = get_workspace_resources(workspace_id)
+    ws_name = ws_resources.get("name", "") if ws_resources else ""
+    group_name = args.group
+    if ws_resources:
+        group = ws_resources.get("compute_groups", {}).get(group_id)
+        if group:
+            group_name = group.get("name", group_id)
+
+    display.print("[dim]正在查询规格列表...[/dim]")
+    try:
+        specs = api.list_specs(group_id)
+    except QzAPIError as e:
+        display.print_error(f"查询规格失败: {e}")
+        return 1
+
+    title = f"规格列表 [{group_name}]"
+    if ws_name:
+        title += f" - {ws_name}"
+    elif workspace_id:
+        title += f" - {workspace_id}"
+    _print_specs_summary(display, specs, title)
+
+    if args.json:
+        print(json.dumps(specs, indent=2, ensure_ascii=False))
+
     return 0
 
 
@@ -1944,6 +2288,11 @@ def main():
     track_parser.add_argument("--source", help="来源脚本")
     track_parser.add_argument("--workspace", help="工作空间 ID")
     track_parser.add_argument("--quiet", "-q", action="store_true", help="静默模式")
+
+    # create 命令
+    create_parser = subparsers.add_parser("create", help="通过 OpenAPI 创建训练任务")
+    create_parser.add_argument("--file", "-f", required=True, help="完整任务配置 JSON 文件")
+    create_parser.add_argument("--json", "-j", action="store_true", help="输出原始 API 响应 JSON")
     
     # import 命令
     import_parser = subparsers.add_parser("import", help="从文件导入任务")
@@ -1968,6 +2317,13 @@ def main():
     cookie_parser.add_argument("--show", action="store_true", help="显示当前 cookie")
     cookie_parser.add_argument("--clear", action="store_true", help="清除 cookie")
     cookie_parser.add_argument("--no-test", action="store_true", help="不测试 cookie 有效性")
+
+    # proxy 命令
+    proxy_parser = subparsers.add_parser("proxy", help="设置全局代理（支持 https / socks5）")
+    proxy_parser.add_argument("proxy", nargs="?", help="代理 URL，例如 https://host:port 或 socks5://host:port")
+    proxy_parser.add_argument("--show", action="store_true", help="显示当前代理配置")
+    proxy_parser.add_argument("--clear", action="store_true", help="清除保存的代理配置")
+    proxy_parser.add_argument("--test", action="store_true", help="测试当前代理连通性")
     
     # login 命令
     login_parser = subparsers.add_parser("login", help="通过 CAS 统一认证登录获取 cookie")
@@ -1991,6 +2347,12 @@ def main():
     workspaces_parser.add_argument("--update", "-u", action="store_true", help="强制从 API 更新缓存")
     workspaces_parser.add_argument("--list", "-l", action="store_true", help="列出所有已缓存的工作空间")
     workspaces_parser.add_argument("--name", help="设置工作空间名称（别名）")
+
+    # specs 命令
+    specs_parser = subparsers.add_parser("specs", help="查询计算组可用规格")
+    specs_parser.add_argument("--workspace", "-w", required=True, help="工作空间名称或 ID")
+    specs_parser.add_argument("--group", "-g", required=True, help="计算组名称或 ID")
+    specs_parser.add_argument("--json", "-j", action="store_true", help="输出原始规格 JSON")
     
     # avail 命令 - 查询空余节点
     avail_parser = subparsers.add_parser("avail", aliases=["av"], help="查询计算组空余节点，帮助决定任务应该提交到哪里")
@@ -2026,11 +2388,13 @@ def main():
         "watch": cmd_watch,
         "w": cmd_watch,
         "track": cmd_track,
+        "create": cmd_create,
         "import": cmd_import,
         "remove": cmd_remove,
         "rm": cmd_remove,
         "clear": cmd_clear,
         "cookie": cmd_cookie,
+        "proxy": cmd_proxy,
         "login": cmd_login,
         "workspace": cmd_workspace,
         "ws": cmd_workspace,
@@ -2038,6 +2402,7 @@ def main():
         "lsws": cmd_workspaces,
         "resources": cmd_workspaces,
         "res": cmd_workspaces,
+        "specs": cmd_specs,
         "avail": cmd_avail,
         "av": cmd_avail,
         "usage": cmd_usage,

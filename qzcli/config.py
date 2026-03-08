@@ -12,6 +12,7 @@ DEFAULT_CONFIG = {
     "api_base_url": "https://qz.sii.edu.cn",
     "username": "",
     "password": "",
+    "proxy_url": "",
     "token_cache_enabled": True,
 }
 
@@ -69,6 +70,29 @@ def get_api_base_url() -> str:
     return os.environ.get("QZCLI_API_URL") or config.get("api_base_url", DEFAULT_CONFIG["api_base_url"])
 
 
+def get_proxy_url() -> str:
+    """获取代理 URL，优先使用环境变量。"""
+    env_proxy = os.environ.get("QZCLI_PROXY_URL")
+    if env_proxy and env_proxy.strip():
+        return env_proxy.strip()
+
+    config = load_config()
+    return (config.get("proxy_url") or "").strip()
+
+
+def get_proxy_source() -> Optional[str]:
+    """获取当前代理配置来源。"""
+    env_proxy = os.environ.get("QZCLI_PROXY_URL")
+    if env_proxy and env_proxy.strip():
+        return "env"
+
+    config = load_config()
+    if (config.get("proxy_url") or "").strip():
+        return "config"
+
+    return None
+
+
 def init_config(username: str, password: str, api_base_url: Optional[str] = None) -> None:
     """初始化配置"""
     config = load_config()
@@ -76,6 +100,20 @@ def init_config(username: str, password: str, api_base_url: Optional[str] = None
     config["password"] = password
     if api_base_url:
         config["api_base_url"] = api_base_url
+    save_config(config)
+
+
+def save_proxy_url(proxy_url: str) -> None:
+    """保存代理 URL。"""
+    config = load_config()
+    config["proxy_url"] = proxy_url.strip()
+    save_config(config)
+
+
+def clear_proxy_url() -> None:
+    """清除保存的代理 URL。"""
+    config = load_config()
+    config["proxy_url"] = ""
     save_config(config)
 
 

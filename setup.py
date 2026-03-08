@@ -15,6 +15,7 @@ setup(
     install_requires=[
         "requests>=2.28",
         "rich>=13.0",
+        "PySocks>=1.7.1",
     ],
     entry_points={
         "console_scripts": [

@@ -3,3 +3,4 @@ cookies.txt
 */__pycache__/*
 qzcli.egg-info/*
 build
+.DS_Store
