@@ -18,6 +18,7 @@ from . import __version__
 from .config import (
     init_config, get_credentials, load_config, CONFIG_DIR, 
     save_cookie, get_cookie, clear_cookie,
+    get_login_credentials, save_login_credentials,
     save_proxy_url, get_proxy_url, get_proxy_source, clear_proxy_url,
     get_api_base_url,
     save_resources, get_workspace_resources, load_all_resources,
@@ -182,6 +183,85 @@ def _load_json_object(filepath: str) -> Dict[str, Any]:
         raise ValueError("JSON 文件必须是对象，顶层不能是数组或其他类型")
 
     return data
+
+
+def _merge_tracked_job(existing: JobRecord, incoming: JobRecord) -> JobRecord:
+    """合并已追踪任务和最新平台数据。"""
+    merged = existing.to_dict()
+    merged.update(incoming.to_dict())
+
+    merged_metadata = dict(existing.metadata or {})
+    merged_metadata.update(incoming.metadata or {})
+    merged["metadata"] = merged_metadata
+    merged["source"] = existing.source or incoming.source
+
+    if not merged.get("url"):
+        merged["url"] = existing.url
+
+    return JobRecord.from_dict(merged)
+
+
+def _sync_jobs_to_store(jobs: Sequence[JobRecord]) -> Dict[str, int]:
+    """批量同步任务到本地追踪列表。"""
+    store = get_store()
+    unique_jobs: Dict[str, JobRecord] = {}
+
+    for job in jobs:
+        if not job.job_id:
+            continue
+
+        existing_job = unique_jobs.get(job.job_id)
+        if existing_job is None or ((job.created_at or "") >= (existing_job.created_at or "")):
+            unique_jobs[job.job_id] = job
+
+    added = 0
+    updated = 0
+
+    for job_id, job in unique_jobs.items():
+        existing = store.get(job_id)
+        if existing is None:
+            store.add(job)
+            added += 1
+            continue
+
+        store.add(_merge_tracked_job(existing, job))
+        updated += 1
+
+    return {"added": added, "updated": updated, "total": len(unique_jobs)}
+
+
+def _fetch_cookie_jobs_for_workspace(api, workspace_id: str, cookie: str, args) -> List[Dict[str, Any]]:
+    """按工作空间抓取任务；--track 时抓取整个作用域。"""
+    if not args.track:
+        result = api.list_jobs_with_cookie(
+            workspace_id,
+            cookie,
+            page_size=args.limit * 2 if args.running else args.limit,
+        )
+        return result.get("jobs", [])
+
+    page_num = 1
+    page_size = max(args.limit, 100)
+    all_jobs: List[Dict[str, Any]] = []
+
+    while True:
+        result = api.list_jobs_with_cookie(workspace_id, cookie, page_num=page_num, page_size=page_size)
+        page_jobs = result.get("jobs", [])
+        total = result.get("total", 0)
+
+        if not page_jobs:
+            break
+
+        all_jobs.extend(page_jobs)
+
+        if total and len(all_jobs) >= total:
+            break
+        if len(page_jobs) < page_size:
+            break
+
+        page_num += 1
+
+    return all_jobs
 
 
 def _validate_job_payload(payload: Dict[str, Any]) -> None:
@@ -398,7 +478,7 @@ def cmd_list_cookie(args):
         ws_name = ws_resources.get("name", "") if ws_resources else ""
         workspace_ids = [(default_ws, ws_name)]
     
-    all_jobs = []
+    raw_jobs = []
     
     for workspace_id, ws_name in workspace_ids:
         try:
@@ -407,13 +487,7 @@ def cmd_list_cookie(args):
             else:
                 display.print(f"[dim]正在从 API 获取任务列表...[/dim]")
             
-            result = api.list_jobs_with_cookie(
-                workspace_id, 
-                cookie, 
-                page_size=args.limit * 2 if args.running else args.limit
-            )
-            
-            jobs_data = result.get("jobs", [])
+            jobs_data = _fetch_cookie_jobs_for_workspace(api, workspace_id, cookie, args)
             
             # 转换为 JobRecord 格式
             for job_data in jobs_data:
@@ -421,7 +495,7 @@ def cmd_list_cookie(args):
                 # 添加工作空间名称
                 if ws_name:
                     job.metadata["workspace_name"] = ws_name
-                all_jobs.append(job)
+                raw_jobs.append(job)
                 
         except QzAPIError as e:
             if "401" in str(e) or "过期" in str(e):
@@ -430,9 +504,14 @@ def cmd_list_cookie(args):
             display.print_warning(f"获取 {ws_name or workspace_id} 失败: {e}")
             continue
     
-    if not all_jobs:
+    if not raw_jobs:
         display.print("[dim]暂无任务[/dim]")
         return 0
+
+    if args.track:
+        sync_stats = _sync_jobs_to_store(raw_jobs)
+
+    all_jobs = list(raw_jobs)
     
     # 按创建时间排序
     all_jobs.sort(key=lambda x: x.created_at or "", reverse=True)
@@ -453,6 +532,10 @@ def cmd_list_cookie(args):
     all_jobs = all_jobs[:args.limit]
     
     if not all_jobs:
+        if args.track:
+            display.print(
+                f"[dim]已同步到本地追踪列表: 新增 {sync_stats['added']}，更新 {sync_stats['updated']}，总计 {sync_stats['total']}[/dim]"
+            )
         display.print("[dim]暂无符合条件的任务[/dim]")
         return 0
     
@@ -467,12 +550,22 @@ def cmd_list_cookie(args):
         display.print_jobs_wide(all_jobs)
     else:
         display.print_jobs_table(all_jobs, show_command=args.verbose, show_url=args.url)
+
+    if args.track:
+        display.print(
+            f"[dim]已同步到本地追踪列表: 新增 {sync_stats['added']}，更新 {sync_stats['updated']}，总计 {sync_stats['total']}[/dim]"
+        )
     
     return 0
 
 
 def cmd_list(args):
     """列出任务"""
+    if args.track and not args.cookie:
+        display = get_display()
+        display.print_error("--track 仅支持 --cookie 模式，请使用: qzcli ls -c --all-ws --track")
+        return 1
+
     # Cookie 模式：从 API 获取任务
     if args.cookie:
         return cmd_list_cookie(args)
@@ -2180,9 +2273,11 @@ def cmd_login(args):
     
     display = get_display()
     api = get_api()
+
+    saved_username, saved_password = get_login_credentials()
     
     # 获取用户名
-    username = args.username
+    username = args.username or saved_username
     if not username:
         try:
             username = input("学工号: ").strip()
@@ -2195,7 +2290,7 @@ def cmd_login(args):
         return 1
     
     # 获取密码
-    password = args.password
+    password = args.password or saved_password
     if not password:
         try:
             password = getpass.getpass("密码: ")
@@ -2206,12 +2301,18 @@ def cmd_login(args):
     if not password:
         display.print_error("密码不能为空")
         return 1
+
+    if not args.username and not args.password and saved_username and saved_password:
+        display.print("[dim]正在使用已保存的认证信息登录...[/dim]")
     
     display.print("[dim]正在登录...[/dim]")
     
     try:
         cookie = api.login_with_cas(username, password)
         
+        # 保存 login 专用认证信息，避免与 init 的 OpenAPI 密码混用
+        save_login_credentials(username, password)
+
         # 保存 cookie
         save_cookie(cookie, workspace_id=args.workspace)
         
@@ -2264,6 +2365,7 @@ def main():
     list_parser.add_argument("--cookie", "-c", action="store_true", help="使用 cookie 从 API 获取任务（无需本地 store）")
     list_parser.add_argument("--workspace", "-w", help="工作空间（名称或 ID，cookie 模式）")
     list_parser.add_argument("--all-ws", action="store_true", help="查询所有已缓存的工作空间（cookie 模式）")
+    list_parser.add_argument("--track", action="store_true", help="将当前 cookie 模式查到的任务同步到本地追踪列表")
     
     # status 命令
     status_parser = subparsers.add_parser("status", aliases=["st"], help="查看任务状态")

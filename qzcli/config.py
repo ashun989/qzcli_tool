@@ -12,6 +12,8 @@ DEFAULT_CONFIG = {
     "api_base_url": "https://qz.sii.edu.cn",
     "username": "",
     "password": "",
+    "login_username": "",
+    "login_password": "",
     "proxy_url": "",
     "token_cache_enabled": True,
 }
@@ -55,12 +57,22 @@ def save_config(config: Dict[str, Any]) -> None:
 
 
 def get_credentials() -> tuple[str, str]:
-    """获取认证信息，优先使用环境变量"""
+    """获取 OpenAPI 认证信息，优先使用环境变量。"""
     config = load_config()
     
     username = os.environ.get("QZCLI_USERNAME") or config.get("username") or ""
     password = os.environ.get("QZCLI_PASSWORD") or config.get("password") or ""
     
+    return username, password
+
+
+def get_login_credentials() -> tuple[str, str]:
+    """获取 login 使用的认证信息，优先使用独立环境变量。"""
+    config = load_config()
+
+    username = os.environ.get("QZCLI_LOGIN_USERNAME") or config.get("login_username") or ""
+    password = os.environ.get("QZCLI_LOGIN_PASSWORD") or config.get("login_password") or ""
+
     return username, password
 
 
@@ -100,6 +112,14 @@ def init_config(username: str, password: str, api_base_url: Optional[str] = None
     config["password"] = password
     if api_base_url:
         config["api_base_url"] = api_base_url
+    save_config(config)
+
+
+def save_login_credentials(username: str, password: str) -> None:
+    """保存 login 使用的用户名密码。"""
+    config = load_config()
+    config["login_username"] = username
+    config["login_password"] = password
     save_config(config)
 
 

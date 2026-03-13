@@ -118,6 +118,9 @@ qzcli login
 # 带参数登录
 qzcli login -u 学工号 -p 密码
 
+# 如果之前成功执行过 qzcli login，后续也可以直接复用它保存的登录认证信息
+qzcli login
+
 # 设置全局 HTTPS 代理
 qzcli proxy https://127.0.0.1:7890
 
@@ -189,6 +192,7 @@ qzcli avail -n 4 -e
 # Cookie 模式（从 API 获取）
 qzcli ls -c -w CI           # 指定工作空间
 qzcli ls -c --all-ws        # 所有工作空间
+qzcli ls -c --all-ws --track  # 同步所有工作空间任务到本地追踪列表
 qzcli ls -c -w CI -r        # 只看运行中
 qzcli ls -c -w CI -n 50     # 显示 50 条
 
@@ -205,7 +209,7 @@ qzcli ls --no-refresh       # 不刷新状态
 | `status` | 查看任务详情 | `qzcli status job-xxx` |
 | `stop` | 停止任务 | `qzcli stop job-xxx` |
 | `watch` | 实时监控 | `qzcli watch -i 10` |
-| `track` | 追踪任务 | `qzcli track job-xxx` |
+| `track` | 追踪单个任务 | `qzcli track job-xxx` |
 | `create` | 从 JSON 文件创建任务 | `qzcli create -f job.json` |
 | `specs` | 查询计算组可用规格 | `qzcli specs -w CI -g H200` |
 
@@ -221,6 +225,9 @@ qzcli specs -w CI -g H200
 
 # 输出规格原始 JSON
 qzcli specs -w CI -g H200 --json
+
+# 一键把当前可见的所有工作空间任务同步到本地 jobs.json
+qzcli ls -c --all-ws --track
 ```
 
 创建任务的 JSON 文件示意：
@@ -294,7 +301,7 @@ CI-情景智能
 
 | 文件 | 说明 |
 |------|------|
-| `config.json` | API 认证信息与全局代理 |
+| `config.json` | OpenAPI 认证信息、login 独立保存的用户名密码、全局代理 |
 | `jobs.json` | 本地任务历史 |
 | `.cookie` | Cookie（login 命令自动管理） |
 | `resources.json` | 资源缓存（工作空间、计算组等） |
@@ -335,5 +342,6 @@ qzcli proxy --test
 
 - **日常使用**: `qzcli login && qzcli avail` 一键登录并查看资源
 - **提交前**: `qzcli avail -n 4 -e` 找合适的计算组并导出配置
+- **批量追踪**: `qzcli ls -c --all-ws --track` 把当前可见任务同步到本地追踪列表
 - **监控任务**: `qzcli ls -c --all-ws -r` 查看所有工作空间运行中的任务
 - **详细信息**: `qzcli ws` 查看 GPU/CPU/内存使用率
