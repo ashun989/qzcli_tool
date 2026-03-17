@@ -1,15 +1,25 @@
-"""
-任务存储模块 - JSON 文件存储
-"""
+"""任务存储模块 - JSON 文件存储。"""
 
 import json
-import time
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Iterable
 from dataclasses import dataclass, asdict, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from .config import JOBS_FILE, ensure_config_dir
+from .config import JOBS_FILE, JOBS_ARCHIVE_FILE, ensure_config_dir
+
+
+PRUNABLE_STATUSES = frozenset({"job_succeeded", "job_failed", "job_stopped"})
+
+
+def _parse_iso_datetime(value: str) -> Optional[datetime]:
+    """解析 ISO 时间字符串。"""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass
@@ -112,8 +122,9 @@ class JobRecord:
 class JobStore:
     """任务存储"""
     
-    def __init__(self, store_file: Optional[Path] = None):
+    def __init__(self, store_file: Optional[Path] = None, archive_file: Optional[Path] = None):
         self.store_file = store_file or JOBS_FILE
+        self.archive_file = archive_file or JOBS_ARCHIVE_FILE
         self._jobs: Dict[str, JobRecord] = {}
         self._loaded = False
     
@@ -249,6 +260,120 @@ class JobStore:
         """任务总数"""
         self._ensure_loaded()
         return len(self._jobs)
+
+    @staticmethod
+    def _is_prunable_status(status: str, statuses: Optional[Iterable[str]] = None) -> bool:
+        """判断状态是否允许按 TTL 清理。"""
+        allowed = set(statuses) if statuses else set(PRUNABLE_STATUSES)
+        return status in PRUNABLE_STATUSES and status in allowed
+
+    @staticmethod
+    def _last_activity_at(job: JobRecord) -> Optional[datetime]:
+        """返回任务的最后活跃时间。"""
+        for candidate in (job.finished_at, job.updated_at, job.created_at):
+            parsed = _parse_iso_datetime(candidate)
+            if parsed is not None:
+                return parsed
+        return None
+
+    def find_prunable_jobs(
+        self,
+        ttl_days: int,
+        statuses: Optional[Iterable[str]] = None,
+        now: Optional[datetime] = None,
+    ) -> List[JobRecord]:
+        """找出超过 TTL 的可清理任务。"""
+        self._ensure_loaded()
+
+        current_time = now or datetime.now()
+        cutoff = current_time - timedelta(days=ttl_days)
+        jobs_to_prune: List[JobRecord] = []
+
+        for job in self._jobs.values():
+            if not self._is_prunable_status(job.status, statuses):
+                continue
+
+            last_activity = self._last_activity_at(job)
+            if last_activity is None:
+                continue
+
+            if last_activity <= cutoff:
+                jobs_to_prune.append(job)
+
+        jobs_to_prune.sort(
+            key=lambda job: self._last_activity_at(job) or datetime.min,
+            reverse=True,
+        )
+        return jobs_to_prune
+
+    def archive_jobs(
+        self,
+        jobs: List[JobRecord],
+        *,
+        ttl_days: int,
+        reason: str = "ttl_expired",
+        cleaned_at: Optional[datetime] = None,
+        archive_file: Optional[Path] = None,
+    ) -> Path:
+        """把被清理任务追加写入归档文件。"""
+        archive_path = archive_file or self.archive_file
+        ensure_config_dir()
+
+        timestamp = (cleaned_at or datetime.now()).isoformat()
+        with open(archive_path, "a", encoding="utf-8") as f:
+            for job in jobs:
+                payload = {
+                    "cleaned_at": timestamp,
+                    "reason": reason,
+                    "ttl_days": ttl_days,
+                    "job": job.to_dict(),
+                }
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+        return archive_path
+
+    def prune(
+        self,
+        ttl_days: int,
+        *,
+        statuses: Optional[Iterable[str]] = None,
+        dry_run: bool = False,
+        now: Optional[datetime] = None,
+        archive_file: Optional[Path] = None,
+    ) -> Dict[str, Any]:
+        """按 TTL 清理完成态任务。"""
+        if ttl_days < 0:
+            raise ValueError("ttl_days 必须大于等于 0")
+
+        self._ensure_loaded()
+
+        jobs_to_prune = self.find_prunable_jobs(ttl_days, statuses=statuses, now=now)
+        archive_path = archive_file or self.archive_file
+        result = {
+            "scanned": len(self._jobs),
+            "eligible": len(jobs_to_prune),
+            "pruned": 0,
+            "archive_file": archive_path,
+            "jobs": jobs_to_prune,
+        }
+
+        if dry_run or not jobs_to_prune:
+            return result
+
+        current_time = now or datetime.now()
+        self.archive_jobs(
+            jobs_to_prune,
+            ttl_days=ttl_days,
+            cleaned_at=current_time,
+            archive_file=archive_path,
+        )
+
+        for job in jobs_to_prune:
+            self._jobs.pop(job.job_id, None)
+
+        self._save()
+        result["pruned"] = len(jobs_to_prune)
+        return result
     
     def import_from_file(self, filepath: Path, source: str = "") -> int:
         """从文件导入任务 ID"""

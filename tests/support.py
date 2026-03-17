@@ -11,6 +11,7 @@ def temporary_config_state():
         "CONFIG_DIR": config.CONFIG_DIR,
         "CONFIG_FILE": config.CONFIG_FILE,
         "JOBS_FILE": config.JOBS_FILE,
+        "JOBS_ARCHIVE_FILE": config.JOBS_ARCHIVE_FILE,
         "TOKEN_CACHE_FILE": config.TOKEN_CACHE_FILE,
         "COOKIE_FILE": config.COOKIE_FILE,
         "RESOURCES_FILE": config.RESOURCES_FILE,
@@ -21,6 +22,7 @@ def temporary_config_state():
         config.CONFIG_DIR = base
         config.CONFIG_FILE = base / "config.json"
         config.JOBS_FILE = base / "jobs.json"
+        config.JOBS_ARCHIVE_FILE = base / "jobs.archive.jsonl"
         config.TOKEN_CACHE_FILE = base / ".token_cache"
         config.COOKIE_FILE = base / ".cookie"
         config.RESOURCES_FILE = base / "resources.json"

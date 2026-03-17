@@ -22,6 +22,7 @@ DEFAULT_CONFIG = {
 CONFIG_DIR = Path.home() / ".qzcli"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 JOBS_FILE = CONFIG_DIR / "jobs.json"
+JOBS_ARCHIVE_FILE = CONFIG_DIR / "jobs.archive.jsonl"
 TOKEN_CACHE_FILE = CONFIG_DIR / ".token_cache"
 COOKIE_FILE = CONFIG_DIR / ".cookie"
 

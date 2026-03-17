@@ -1,4 +1,5 @@
-from pathlib import Path
+import json
+from datetime import datetime
 import unittest
 
 from qzcli.store import JobRecord, JobStore
@@ -134,6 +135,140 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(sorted(store.list_job_ids()), ["job-plain", "job-tabbed"])
             self.assertEqual(store.get("job-tabbed").name, "eval-name")
             self.assertEqual(store.get("job-plain").source, "import-test")
+
+    def test_find_prunable_jobs_only_returns_terminal_jobs_beyond_ttl(self):
+        with temporary_config_state() as base:
+            store = JobStore(
+                store_file=base / "jobs.json",
+                archive_file=base / "jobs.archive.jsonl",
+            )
+            now = datetime.fromisoformat("2026-03-15T12:00:00")
+
+            store.add(
+                JobRecord(
+                    job_id="job-old-succeeded",
+                    status="job_succeeded",
+                    finished_at="2026-02-01T00:00:00",
+                )
+            )
+            store.add(
+                JobRecord(
+                    job_id="job-recent-failed",
+                    status="job_failed",
+                    finished_at="2026-03-10T00:00:00",
+                )
+            )
+            store.add(
+                JobRecord(
+                    job_id="job-running",
+                    status="job_running",
+                    updated_at="2026-01-01T00:00:00",
+                )
+            )
+            store.add(
+                JobRecord(
+                    job_id="job-unknown",
+                    status="unknown",
+                    updated_at="2026-01-01T00:00:00",
+                )
+            )
+
+            jobs = store.find_prunable_jobs(14, now=now)
+
+            self.assertEqual([job.job_id for job in jobs], ["job-old-succeeded"])
+
+    def test_find_prunable_jobs_falls_back_to_updated_then_created_time(self):
+        with temporary_config_state() as base:
+            store = JobStore(
+                store_file=base / "jobs.json",
+                archive_file=base / "jobs.archive.jsonl",
+            )
+            now = datetime.fromisoformat("2026-03-15T12:00:00")
+
+            store.add(
+                JobRecord(
+                    job_id="job-use-updated",
+                    status="job_failed",
+                    updated_at="2026-02-20T08:00:00",
+                )
+            )
+            store.add(
+                JobRecord(
+                    job_id="job-use-created",
+                    status="job_stopped",
+                    created_at="2026-02-10T08:00:00",
+                )
+            )
+            store.add(
+                JobRecord(
+                    job_id="job-no-time",
+                    status="job_succeeded",
+                )
+            )
+
+            jobs = store.find_prunable_jobs(14, now=now)
+
+            self.assertEqual(
+                sorted(job.job_id for job in jobs),
+                ["job-use-created", "job-use-updated"],
+            )
+
+    def test_prune_archives_then_removes_matching_jobs(self):
+        with temporary_config_state() as base:
+            store = JobStore(
+                store_file=base / "jobs.json",
+                archive_file=base / "jobs.archive.jsonl",
+            )
+            now = datetime.fromisoformat("2026-03-15T12:00:00")
+            store.add(
+                JobRecord(
+                    job_id="job-failed",
+                    status="job_failed",
+                    finished_at="2026-02-01T00:00:00",
+                )
+            )
+            store.add(
+                JobRecord(
+                    job_id="job-running",
+                    status="job_running",
+                    updated_at="2026-02-01T00:00:00",
+                )
+            )
+
+            result = store.prune(14, now=now)
+
+            self.assertEqual(result["eligible"], 1)
+            self.assertEqual(result["pruned"], 1)
+            self.assertEqual(store.list_job_ids(), ["job-running"])
+
+            archive_lines = (base / "jobs.archive.jsonl").read_text(encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(archive_lines), 1)
+            payload = json.loads(archive_lines[0])
+            self.assertEqual(payload["reason"], "ttl_expired")
+            self.assertEqual(payload["ttl_days"], 14)
+            self.assertEqual(payload["job"]["job_id"], "job-failed")
+
+    def test_prune_dry_run_does_not_modify_store_or_archive(self):
+        with temporary_config_state() as base:
+            store = JobStore(
+                store_file=base / "jobs.json",
+                archive_file=base / "jobs.archive.jsonl",
+            )
+            now = datetime.fromisoformat("2026-03-15T12:00:00")
+            store.add(
+                JobRecord(
+                    job_id="job-failed",
+                    status="job_failed",
+                    finished_at="2026-02-01T00:00:00",
+                )
+            )
+
+            result = store.prune(14, dry_run=True, now=now)
+
+            self.assertEqual(result["eligible"], 1)
+            self.assertEqual(result["pruned"], 0)
+            self.assertEqual(store.list_job_ids(), ["job-failed"])
+            self.assertFalse((base / "jobs.archive.jsonl").exists())
 
 
 if __name__ == "__main__":
