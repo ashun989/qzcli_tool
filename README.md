@@ -209,7 +209,9 @@ qzcli ls --no-refresh       # 不刷新状态
 | `status` | 查看任务详情 | `qzcli status job-xxx` |
 | `stop` | 停止任务 | `qzcli stop job-xxx` |
 | `watch` | 实时监控 | `qzcli watch -i 10` |
+| `retry-watch` | 单次检查任务；失败后复制配置并自动重提 | `qzcli retry-watch --name qz_train_narbd_sft2 -w CI` |
 | `track` | 追踪单个任务 | `qzcli track job-xxx` |
+| `prune` | 清理过期历史任务 | `qzcli prune --days 14` |
 | `create` | 从 JSON 文件创建任务 | `qzcli create -f job.json` |
 | `specs` | 查询计算组可用规格 | `qzcli specs -w CI -g H200` |
 
@@ -220,6 +222,15 @@ qzcli create -f job.json
 # 创建后显示原始 API 响应
 qzcli create -f job.json --json
 
+# 单次检查指定任务名；如果任务失败则保存当前配置到 ~/.qzcli/retry_configs 并自动重提
+qzcli retry-watch --name qz_train_narbd_sft2 -w CI --max-retries 3
+
+# 已知 job_id 时，也可以直接检查该任务
+qzcli retry-watch --job-id job-xxx
+
+# 结合 cron / while 循环做周期检查
+*/5 * * * * conda run -n parser python -m qzcli.cli retry-watch --name qz_train_narbd_sft2 -w CI --max-retries 3
+
 # 查询某个工作空间计算组的规格
 qzcli specs -w CI -g H200
 
@@ -228,7 +239,19 @@ qzcli specs -w CI -g H200 --json
 
 # 一键把当前可见的所有工作空间任务同步到本地 jobs.json
 qzcli ls -c --all-ws --track
+
+# 预览将被归档并清理的历史完成任务
+qzcli prune --days 14 --dry-run
+
+# 归档并删除超过 14 天的完成态任务
+qzcli prune --days 14 -y
 ```
+
+如果 `--name` 在同一工作空间命中多条同名任务，`retry-watch` 会打印候选列表。交互终端里可以直接输入 `1/2/3/...` 选择目标任务；非交互环境下则只打印候选并退出。候选列表会包含 `job_id`、状态、提交时间、项目、计算组等信息。
+
+当使用 `--name` 且当前保存的 cookie 已过期时，`retry-watch` 会优先尝试用已保存的 login 凭证自动重新登录并刷新 cookie；如果本地没有保存 login 凭证，则会报错并提示先执行 `qzcli login`。
+
+如果目标任务当前还在 `running/pending/queuing`，`retry-watch` 不会直接退出为“什么都没做”，而是会把这条任务登记到本地监控链里。后续再次用同一个根 `job_id` 或同一个任务名执行时，会自动跟到最新一次重提出来的子任务，并在其失败时继续重提。
 
 创建任务的 JSON 文件示意：
 
@@ -302,9 +325,11 @@ CI-情景智能
 | 文件 | 说明 |
 |------|------|
 | `config.json` | OpenAPI 认证信息、login 独立保存的用户名密码、全局代理 |
-| `jobs.json` | 本地任务历史 |
+| `jobs.json` | 本地活跃追踪列表 |
+| `jobs.archive.jsonl` | 被 `qzcli prune` 归档的历史任务 |
 | `.cookie` | Cookie（login 命令自动管理） |
 | `resources.json` | 资源缓存（工作空间、计算组等） |
+| `retry_configs/` | `retry-watch` 自动保存的失败任务配置快照 |
 
 ## 环境变量
 
@@ -343,5 +368,8 @@ qzcli proxy --test
 - **日常使用**: `qzcli login && qzcli avail` 一键登录并查看资源
 - **提交前**: `qzcli avail -n 4 -e` 找合适的计算组并导出配置
 - **批量追踪**: `qzcli ls -c --all-ws --track` 把当前可见任务同步到本地追踪列表
+- **清理历史**: `qzcli prune --days 14 -y` 归档并清理超过 14 天的完成态任务
 - **监控任务**: `qzcli ls -c --all-ws -r` 查看所有工作空间运行中的任务
 - **详细信息**: `qzcli ws` 查看 GPU/CPU/内存使用率
+
+`watch` 和本地 `qzcli ls` 读取的是当前 `jobs.json`。如果追踪列表长期积累导致历史任务过多，可用 `qzcli prune` 把旧的完成态任务转存到 `jobs.archive.jsonl`。

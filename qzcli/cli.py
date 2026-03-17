@@ -7,7 +7,9 @@ import sys
 import time
 import argparse
 import json
+import copy
 import unicodedata
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Sequence, Dict, Any
 from urllib.parse import urlparse
@@ -26,7 +28,7 @@ from .config import (
     list_cached_workspaces, update_workspace_projects, update_workspace_compute_groups,
 )
 from .api import get_api, QzAPIError
-from .store import get_store, JobRecord
+from .store import get_store, JobRecord, PRUNABLE_STATUSES
 from .display import get_display, format_duration, format_time_ago
 
 try:
@@ -37,6 +39,21 @@ except ImportError:
     RICH_TABLE_AVAILABLE = False
     Table = None  # type: ignore
     box = None  # type: ignore
+
+
+DEFAULT_PRUNE_TTL_DAYS = 14
+DEFAULT_RETRY_WATCH_MAX_RETRIES = 3
+TERMINAL_JOB_STATUSES = frozenset({"job_succeeded", "job_failed", "job_stopped"})
+
+
+class RetryWatchSelectionRequired(ValueError):
+    """按任务名匹配到多条候选时，要求用户显式指定 job_id。"""
+
+    def __init__(self, job_name: str, workspace_id: str, candidates: List[Dict[str, Any]]):
+        super().__init__(f"任务名 {job_name!r} 在工作空间 {workspace_id} 下存在多条候选，请改用 --job-id")
+        self.job_name = job_name
+        self.workspace_id = workspace_id
+        self.candidates = candidates
 
 
 def _char_display_width(ch: str) -> int:
@@ -290,6 +307,277 @@ def _validate_job_payload(payload: Dict[str, Any]) -> None:
     fc_missing = [field for field in required_framework_fields if field not in framework_config[0]]
     if fc_missing:
         raise ValueError(f"framework_config[0] 缺少必填字段: {', '.join(fc_missing)}")
+
+
+def _normalize_retry_framework_config_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    """把 detail 响应中的 framework_config 规整成 create 可复用的格式。"""
+    normalized = copy.deepcopy(item)
+    spec_info = normalized.get("instance_spec_price_info", {})
+    if not isinstance(spec_info, dict):
+        spec_info = {}
+
+    spec_id = (
+        normalized.get("spec_id")
+        or normalized.get("quota_id")
+        or spec_info.get("quota_id")
+        or spec_info.get("spec_id")
+    )
+    if spec_id:
+        normalized["spec_id"] = spec_id
+
+    if normalized.get("shm_gi") is None:
+        normalized["shm_gi"] = 0
+
+    return normalized
+
+
+def _build_retry_payload(job_detail: Dict[str, Any]) -> Dict[str, Any]:
+    """从任务详情提取可直接重提的 payload。"""
+    if not isinstance(job_detail, dict) or not job_detail:
+        raise ValueError("任务详情为空，无法复制配置")
+
+    payload = copy.deepcopy(job_detail)
+    if "framework_config" not in payload and "framewrok_config" in payload:
+        payload["framework_config"] = payload.pop("framewrok_config")
+
+    priority = payload.get("task_priority")
+    if priority in (None, "") and payload.get("priority_level") not in (None, ""):
+        raw_priority = payload.get("priority_level")
+        try:
+            payload["task_priority"] = int(raw_priority)
+        except (TypeError, ValueError):
+            payload["task_priority"] = raw_priority
+
+    framework_config = payload.get("framework_config", [])
+    if isinstance(framework_config, list):
+        payload["framework_config"] = [
+            _normalize_retry_framework_config_item(item)
+            for item in framework_config
+            if isinstance(item, dict)
+        ]
+
+    for key in (
+        "job_id",
+        "id",
+        "status",
+        "created_at",
+        "updated_at",
+        "finished_at",
+        "running_time_ms",
+        "priority_level",
+        "logic_compute_group_name",
+        "project_name",
+        "creator",
+        "url",
+    ):
+        payload.pop(key, None)
+
+    _validate_job_payload(payload)
+    return payload
+
+
+def _sanitize_retry_filename(value: str) -> str:
+    """把任务名转成稳定文件名。"""
+    cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in (value or "job"))
+    cleaned = cleaned.strip("_")
+    return cleaned or "job"
+
+
+def _save_retry_payload(
+    payload: Dict[str, Any],
+    config_dir: str,
+    job_name: str,
+    source_job_id: str,
+    retry_index: int,
+) -> Path:
+    """把自动重提使用的配置落盘，便于排查。"""
+    output_dir = Path(config_dir).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    safe_name = _sanitize_retry_filename(job_name)
+    filename = f"{safe_name}.retry{retry_index}.{timestamp}.{source_job_id}.json"
+    output_path = output_dir / filename
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    return output_path
+
+
+def _refresh_cookie_with_saved_login(display, api, workspace_id: str) -> str:
+    """使用已保存的 login 凭证静默刷新 cookie。"""
+    username, password = get_login_credentials()
+    if not username or not password:
+        raise ValueError("Cookie 已失效，且未保存 login 凭证，请先运行 qzcli login")
+
+    display.print("[dim]检测到 cookie 已失效，正在尝试自动重新登录...[/dim]")
+    cookie = api.login_with_cas(username, password)
+    save_login_credentials(username, password)
+    save_cookie(cookie, workspace_id=workspace_id)
+    display.print_success("Cookie 已自动刷新")
+    return cookie
+
+
+def _resolve_retry_watch_leaf_job_id(store, job_id: str) -> str:
+    """沿着 retry_submitted_job_id 链找到当前最新任务。"""
+    current_job_id = job_id
+    seen = set()
+
+    while current_job_id and current_job_id not in seen:
+        seen.add(current_job_id)
+        current_record = store.get(current_job_id)
+        if not current_record:
+            break
+        next_job_id = str((current_record.metadata or {}).get("retry_submitted_job_id", "") or "")
+        if not next_job_id:
+            break
+        current_job_id = next_job_id
+
+    return current_job_id or job_id
+
+
+def _mark_retry_watch_armed(
+    store,
+    job: Optional[JobRecord],
+    *,
+    root_job_id: str,
+    selected_by_name: str,
+    max_retries: int,
+) -> None:
+    """给当前任务记录补充自动重提监控元数据。"""
+    if job is None:
+        return
+
+    job.metadata = dict(job.metadata or {})
+    job.metadata.update(
+        {
+            "retry_watch_enabled": True,
+            "retry_watch_root_job_id": root_job_id,
+            "retry_watch_selected_by_name": selected_by_name,
+            "retry_watch_max_retries": max_retries,
+            "retry_watch_armed_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    )
+    store.add(job)
+
+
+def _format_epoch_ms(timestamp_ms: Any) -> str:
+    """格式化毫秒时间戳，失败时原样返回。"""
+    try:
+        return datetime.fromtimestamp(int(timestamp_ms) / 1000).strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError, OSError):
+        return str(timestamp_ms or "-")
+
+
+def _print_retry_watch_candidates(display, workspace_id: str, candidates: Sequence[Dict[str, Any]]) -> None:
+    """输出同名任务候选列表，供用户手动选择 job_id。"""
+    workspace_name = ""
+    ws_resources = get_workspace_resources(workspace_id)
+    if ws_resources:
+        workspace_name = ws_resources.get("name", "") or ""
+
+    title = f"检测到同名任务候选 ({len(candidates)} 条)"
+    if workspace_name:
+        title += f" [{workspace_name}]"
+    display.print(f"[bold]{title}[/bold]")
+    display.print(f"[dim]工作空间: {workspace_id}[/dim]")
+
+    rows = []
+    for index, item in enumerate(candidates, start=1):
+        rows.append(
+            (
+                index,
+                str(item.get("job_id", "")),
+                str(item.get("status", "") or "-"),
+                _format_epoch_ms(item.get("created_at", "")),
+                str(item.get("project_name", "") or item.get("project_id", "") or "-"),
+                str(item.get("logic_compute_group_name", "") or item.get("logic_compute_group_id", "") or "-"),
+            )
+        )
+
+    for line in _render_plain_table(
+        ("No.", "Job ID", "Status", "Created", "Project", "Compute Group"),
+        rows,
+        ("right", "left", "left", "left", "left", "left"),
+        min_widths=(3, 36, 12, 19, 12, 12),
+        max_widths=(4, 36, 14, 19, 28, 28),
+    ):
+        display.print(line)
+
+    display.print("[dim]可输入编号直接选择；非交互环境下请复制目标 Job ID 后重新执行 qzcli retry-watch --job-id <job_id>[/dim]")
+
+
+def _prompt_retry_watch_candidate_selection(display, candidates: Sequence[Dict[str, Any]]) -> Optional[str]:
+    """在交互终端中让用户按编号选择目标任务。"""
+    if not sys.stdin.isatty():
+        return None
+
+    while True:
+        try:
+            value = input("请选择任务编号（直接回车取消）: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            display.print("\n[dim]已取消[/dim]")
+            return None
+
+        if not value:
+            display.print("[dim]已取消，请改用 --job-id 重新执行[/dim]")
+            return None
+
+        if not value.isdigit():
+            display.print_warning("请输入候选编号，例如 1")
+            continue
+
+        index = int(value)
+        if not 1 <= index <= len(candidates):
+            display.print_warning(f"编号超出范围，请输入 1-{len(candidates)}")
+            continue
+
+        selected = candidates[index - 1]
+        job_id = str(selected.get("job_id", ""))
+        if not job_id:
+            display.print_warning("所选候选缺少 job_id，请重新选择")
+            continue
+        display.print_success(f"已选择任务: {job_id}")
+        return job_id
+
+
+def _resolve_retry_watch_job_id(display, api, job_name: str, workspace_input: str) -> str:
+    """按任务名解析当前最新任务 ID。"""
+    cookie_data = get_cookie()
+    workspace_raw = workspace_input or cookie_data.get("workspace_id", "")
+    if not workspace_raw:
+        raise ValueError("按任务名监控时必须指定工作空间，或先为 cookie 设置默认 workspace")
+
+    workspace_id = _resolve_workspace_id(workspace_raw)
+    cookie = cookie_data.get("cookie", "") if cookie_data else ""
+    if not cookie:
+        try:
+            cookie = _refresh_cookie_with_saved_login(display, api, workspace_id)
+        except (ValueError, QzAPIError) as e:
+            raise ValueError(str(e)) from e
+
+    fetch_args = argparse.Namespace(track=True, limit=100, running=False)
+    try:
+        jobs = _fetch_cookie_jobs_for_workspace(api, workspace_id, cookie, fetch_args)
+    except QzAPIError as e:
+        if getattr(e, "code", None) != 401 and "Cookie 已过期或无效" not in str(e):
+            raise
+        try:
+            cookie = _refresh_cookie_with_saved_login(display, api, workspace_id)
+        except (ValueError, QzAPIError) as refresh_error:
+            raise ValueError(str(refresh_error)) from refresh_error
+        jobs = _fetch_cookie_jobs_for_workspace(api, workspace_id, cookie, fetch_args)
+
+    matched_jobs = [job for job in jobs if str(job.get("name", "")) == job_name]
+    if not matched_jobs:
+        raise ValueError(f"在工作空间 {workspace_id} 中未找到名称为 {job_name!r} 的任务")
+    if len(matched_jobs) > 1:
+        matched_jobs.sort(key=lambda item: int(item.get("created_at") or 0), reverse=True)
+        raise RetryWatchSelectionRequired(job_name, workspace_id, matched_jobs)
+
+    job_id = str(matched_jobs[0].get("job_id", ""))
+    if not job_id:
+        raise ValueError(f"任务 {job_name!r} 缺少 job_id，无法监控")
+    return job_id
 
 
 def _resolve_workspace_id(workspace_input: str) -> str:
@@ -852,6 +1140,61 @@ def cmd_clear(args):
     return 0
 
 
+def cmd_prune(args):
+    """按 TTL 清理已完成任务。"""
+    display = get_display()
+    store = get_store()
+
+    if args.days < 0:
+        display.print_error("--days 必须大于等于 0")
+        return 1
+
+    statuses = [args.status] if getattr(args, "status", None) else None
+    invalid_statuses = [status for status in (statuses or []) if status not in PRUNABLE_STATUSES]
+    if invalid_statuses:
+        display.print_error(
+            "prune 仅支持清理终态任务，允许的状态: "
+            + ", ".join(sorted(PRUNABLE_STATUSES))
+        )
+        return 1
+
+    try:
+        preview = store.prune(args.days, statuses=statuses, dry_run=True)
+    except ValueError as e:
+        display.print_error(str(e))
+        return 1
+
+    display.print(f"扫描任务数: {preview['scanned']}")
+    display.print(f"可清理任务数: {preview['eligible']}")
+    display.print(f"归档文件: {preview['archive_file']}")
+
+    if args.dry_run:
+        display.print("[dim]dry-run 模式，未修改本地任务记录[/dim]")
+        return 0
+
+    if preview["eligible"] == 0:
+        display.print("没有符合条件的历史任务需要清理")
+        return 0
+
+    if not args.yes:
+        confirm = input(
+            f"确定要归档并删除 {preview['eligible']} 个超过 {args.days} 天的任务记录? [y/N] "
+        ).strip().lower()
+        if confirm != "y":
+            display.print("已取消")
+            return 0
+
+    try:
+        result = store.prune(args.days, statuses=statuses, dry_run=False)
+    except OSError as e:
+        display.print_error(f"清理失败: {e}")
+        return 1
+
+    display.print_success(f"已清理 {result['pruned']} 个任务记录")
+    display.print(f"归档文件: {result['archive_file']}")
+    return 0
+
+
 def cmd_cookie(args):
     """设置浏览器 cookie"""
     display = get_display()
@@ -1041,6 +1384,161 @@ def cmd_create(args):
     if args.json:
         print(json.dumps(result, indent=2, ensure_ascii=False))
 
+    return 0
+
+
+def cmd_retry_watch(args):
+    """单次检查任务，失败后复制配置并自动重提。"""
+    display = get_display()
+    api = get_api()
+    store = get_store()
+
+    if args.max_retries < 0:
+        display.print_error("--max-retries 必须大于等于 0")
+        return 1
+
+    if not args.job_id and not args.name:
+        display.print_error("请通过 --job-id 或 --name 指定要监控的任务")
+        return 1
+
+    if args.job_id:
+        root_job_id = args.job_id
+        current_job_id = _resolve_retry_watch_leaf_job_id(store, root_job_id)
+    else:
+        try:
+            current_job_id = _resolve_retry_watch_job_id(display, api, args.name, args.workspace or "")
+        except RetryWatchSelectionRequired as e:
+            _print_retry_watch_candidates(display, e.workspace_id, e.candidates)
+            selected_job_id = _prompt_retry_watch_candidate_selection(display, e.candidates)
+            if not selected_job_id:
+                return 2
+            current_job_id = selected_job_id
+        except ValueError as e:
+            display.print_error(str(e))
+            return 1
+        root_job_id = current_job_id
+
+    if current_job_id != root_job_id:
+        display.print(f"[dim]监控链已切换到最新任务: {current_job_id} (root: {root_job_id})[/dim]")
+
+    config_dir = args.config_dir or str(CONFIG_DIR / "retry_configs")
+    display.print(f"[bold]自动检查重提[/bold] (任务: {args.name or current_job_id}, 最大重试: {args.max_retries})")
+    display.print(f"[dim]配置快照目录: {Path(config_dir).expanduser()}[/dim]")
+
+    try:
+        job_detail = api.get_job_detail(current_job_id)
+    except QzAPIError as e:
+        display.print_error(f"查询任务 {current_job_id} 失败: {e}")
+        return 1
+
+    current_record = store.update_from_api(current_job_id, job_detail)
+    status = str(job_detail.get("status", "") or "unknown")
+    job_name = str(job_detail.get("name", "") or args.name or current_job_id)
+    display.print(f"{job_name} [{current_job_id}] -> {status}")
+
+    if status == "job_succeeded":
+        display.print_success(f"任务已成功，无需重提: {job_name} [{current_job_id}]")
+        return 0
+
+    if status == "job_stopped":
+        display.print_warning(f"任务已停止，未执行重提: {job_name} [{current_job_id}]")
+        return 0
+
+    if status != "job_failed":
+        _mark_retry_watch_armed(
+            store,
+            current_record,
+            root_job_id=root_job_id,
+            selected_by_name=args.name or "",
+            max_retries=args.max_retries,
+        )
+        display.print_success(f"已挂上监控，当前状态为 {status}，后续失败时会自动重提")
+        return 0
+
+    if current_record and current_record.metadata.get("retry_submitted_job_id"):
+        display.print_warning(
+            f"该失败任务已处理过，已提交的新任务: {current_record.metadata['retry_submitted_job_id']}"
+        )
+        return 0
+
+    current_retry_depth = 0
+    if current_record:
+        try:
+            current_retry_depth = int(current_record.metadata.get("retry_index", 0) or 0)
+        except (TypeError, ValueError):
+            current_retry_depth = 0
+
+    retry_index = current_retry_depth + 1
+    if retry_index > args.max_retries:
+        display.print_error(f"任务已失败，且已达到最大自动重试次数: {args.max_retries}")
+        return 2
+
+    try:
+        payload = _build_retry_payload(job_detail)
+    except ValueError as e:
+        display.print_error(f"生成重提配置失败: {e}")
+        return 1
+
+    config_path = _save_retry_payload(payload, config_dir, job_name, current_job_id, retry_index)
+    display.print_warning(
+        f"检测到任务失败，已保存配置快照并开始重提 ({retry_index}/{args.max_retries}): {config_path}"
+    )
+
+    try:
+        result = api.create_job(payload)
+    except QzAPIError as e:
+        display.print_error(f"自动重提失败: {e}")
+        return 1
+
+    new_job_id = _extract_created_job_id(result if isinstance(result, dict) else {})
+    if not new_job_id:
+        display.print_error("自动重提成功但响应未返回 job_id，无法继续追踪")
+        return 1
+
+    if current_record is not None:
+        current_record.metadata = dict(current_record.metadata or {})
+        current_record.metadata.update(
+            {
+                "retry_submitted_job_id": new_job_id,
+                "retry_config_snapshot": str(config_path),
+                "retry_index": current_retry_depth,
+                "retry_watch_root_job_id": root_job_id,
+                "retry_watch_selected_by_name": args.name or current_record.metadata.get("retry_watch_selected_by_name", ""),
+                "retry_watch_enabled": True,
+                "retry_watch_max_retries": args.max_retries,
+            }
+        )
+        store.add(current_record)
+
+    workspace_id = str(payload.get("workspace_id", ""))
+    url = _build_job_url(new_job_id, workspace_id)
+    framework_config = payload.get("framework_config", [])
+    first_config = framework_config[0] if framework_config and isinstance(framework_config[0], dict) else {}
+    store.add(
+        JobRecord(
+            job_id=new_job_id,
+            name=str(payload.get("name", job_name)),
+            status="job_pending",
+            workspace_id=workspace_id,
+            project_id=str(payload.get("project_id", "")),
+            command=str(payload.get("command", "")),
+            url=url,
+            source="retry-watch",
+            instance_count=int(first_config.get("instance_count", 0) or 0),
+            gpu_count=int(first_config.get("gpu_count", 0) or 0),
+            metadata={
+                "retry_of": current_job_id,
+                "retry_index": retry_index,
+                "config_snapshot": str(config_path),
+                "retry_watch_root_job_id": root_job_id,
+                "retry_watch_selected_by_name": args.name or "",
+                "retry_watch_enabled": True,
+                "retry_watch_max_retries": args.max_retries,
+            },
+        )
+    )
+
+    display.print_success(f"已自动重提: {new_job_id}")
     return 0
 
 
@@ -2395,6 +2893,19 @@ def main():
     create_parser = subparsers.add_parser("create", help="通过 OpenAPI 创建训练任务")
     create_parser.add_argument("--file", "-f", required=True, help="完整任务配置 JSON 文件")
     create_parser.add_argument("--json", "-j", action="store_true", help="输出原始 API 响应 JSON")
+
+    # retry-watch 命令
+    retry_watch_parser = subparsers.add_parser("retry-watch", help="单次检查任务；失败后复制配置并自动重提")
+    retry_watch_parser.add_argument("--job-id", help="直接检查指定 job_id")
+    retry_watch_parser.add_argument("--name", help="按任务名检查任务（唯一命中时继续，需配合 workspace/cookie）")
+    retry_watch_parser.add_argument("--workspace", "-w", help="工作空间名称或 ID（按任务名检查时使用）")
+    retry_watch_parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=DEFAULT_RETRY_WATCH_MAX_RETRIES,
+        help=f"自动重提上限（默认 {DEFAULT_RETRY_WATCH_MAX_RETRIES}）",
+    )
+    retry_watch_parser.add_argument("--config-dir", help="保存失败任务配置快照的目录")
     
     # import 命令
     import_parser = subparsers.add_parser("import", help="从文件导入任务")
@@ -2410,6 +2921,13 @@ def main():
     # clear 命令
     clear_parser = subparsers.add_parser("clear", help="清空所有任务记录")
     clear_parser.add_argument("--yes", "-y", action="store_true", help="跳过确认")
+
+    # prune 命令
+    prune_parser = subparsers.add_parser("prune", help="按 TTL 清理已完成的历史任务")
+    prune_parser.add_argument("--days", type=int, default=DEFAULT_PRUNE_TTL_DAYS, help="保留天数（默认 14）")
+    prune_parser.add_argument("--dry-run", action="store_true", help="仅预览将被清理的任务，不落盘")
+    prune_parser.add_argument("--status", help="只清理指定终态，例如 job_failed")
+    prune_parser.add_argument("--yes", "-y", action="store_true", help="跳过确认")
     
     # cookie 命令
     cookie_parser = subparsers.add_parser("cookie", help="设置浏览器 cookie（用于访问内部 API）")
@@ -2491,10 +3009,12 @@ def main():
         "w": cmd_watch,
         "track": cmd_track,
         "create": cmd_create,
+        "retry-watch": cmd_retry_watch,
         "import": cmd_import,
         "remove": cmd_remove,
         "rm": cmd_remove,
         "clear": cmd_clear,
+        "prune": cmd_prune,
         "cookie": cmd_cookie,
         "proxy": cmd_proxy,
         "login": cmd_login,
