@@ -209,7 +209,7 @@ qzcli ls --no-refresh       # 不刷新状态
 | `status` | 查看任务详情 | `qzcli status job-xxx` |
 | `stop` | 停止任务 | `qzcli stop job-xxx` |
 | `watch` | 实时监控 | `qzcli watch -i 10` |
-| `retry-watch` | 单次检查任务；失败后复制配置并自动重提 | `qzcli retry-watch --name qz_train_narbd_sft2 -w CI` |
+| `retry-watch` | 单次检查任务；失败后复制配置并自动重提 | `qzcli retry-watch --name <task_name> -w CI` |
 | `track` | 追踪单个任务 | `qzcli track job-xxx` |
 | `prune` | 清理过期历史任务 | `qzcli prune --days 14` |
 | `create` | 从 JSON 文件创建任务 | `qzcli create -f job.json` |
@@ -223,13 +223,13 @@ qzcli create -f job.json
 qzcli create -f job.json --json
 
 # 单次检查指定任务名；如果任务失败则保存当前配置到 ~/.qzcli/retry_configs 并自动重提
-qzcli retry-watch --name qz_train_narbd_sft2 -w CI --max-retries 3
+qzcli retry-watch --name <task_name> -w CI --max-retries 3
 
 # 已知 job_id 时，也可以直接检查该任务
 qzcli retry-watch --job-id job-xxx
 
 # 结合 cron / while 循环做周期检查
-*/5 * * * * conda run -n parser python -m qzcli.cli retry-watch --name qz_train_narbd_sft2 -w CI --max-retries 3
+*/5 * * * * conda run -n parser python -m qzcli.cli retry-watch --name <task_name> -w CI --max-retries 3
 
 # 查询某个工作空间计算组的规格
 qzcli specs -w CI -g H200
